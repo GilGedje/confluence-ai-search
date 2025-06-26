@@ -356,7 +356,16 @@ class DenseRetriever:
     def add_documents(self, documents: List[Document]):
         """Rebuild index for a new set of documents."""
         self.documents = documents
-        texts = [doc.text for doc in documents]
+        texts = []
+        for doc in documents:
+            if hasattr(doc, 'text') and doc.text:
+                texts.append(doc.text)
+            elif hasattr(doc, 'page_content') and doc.page_content:
+                texts.append(doc.page_content)
+            elif hasattr(doc, 'title') and doc.title:
+                texts.append(doc.title)
+            else:
+                texts.append("")
         self.embeddings = self.client.embed_texts(texts)
         self.nn = NearestNeighbors(n_neighbors=self.n_neighbors, **self.nn_kwargs).fit(
             self.embeddings
@@ -538,6 +547,9 @@ class ConfluenceDocumentRetriever:
                     metric="cosine",
                 ),
             )
+            # Unpack if tuple with one value
+            if isinstance(dense_retriever, tuple) and len(dense_retriever) == 1:
+                dense_retriever = dense_retriever[0]
             dense_retriever.add_documents(chunked_docs)
             dense_results = dense_retriever.get_relevant_documents(query)
             await event_emitter.emit_status(
@@ -691,11 +703,28 @@ class Confluence:
     def authenticate(
         self, username: str, api_key: str, api_key_auth: bool
     ) -> Dict[str, str]:
-        """Set up authentication based on configuration"""
-        if api_key_auth:
-            return self.authenticate_api_key(username, api_key)
-        else:
-            return self.authenticate_personal_access_token(api_key)
+        """Try both authentication methods and return the one that succeeds, or raise 401 if both fail."""
+        base_url = getattr(self, 'base_url', DEFAULT_BASE_URL)
+        ssl_verify = getattr(self, 'ssl_verify', True)
+        # Try API key auth first
+        api_key_headers = self.authenticate_api_key(username, api_key)
+        test_url = f"{base_url}/rest/api/space"
+        try:
+            resp = requests.get(test_url, headers=api_key_headers, verify=ssl_verify)
+            if resp.status_code == 200:
+                return api_key_headers
+        except Exception:
+            pass
+        # Try personal access token
+        pat_headers = self.authenticate_personal_access_token(api_key)
+        try:
+            resp = requests.get(test_url, headers=pat_headers, verify=ssl_verify)
+            if resp.status_code == 200:
+                return pat_headers
+        except Exception:
+            pass
+        # If both fail, raise 401
+        raise ConfluenceAuthError("Authentication failed. Check your credentials.")
 
 
 class Tools:
@@ -834,7 +863,7 @@ class Tools:
         :return: A list of search results from Confluence in JSON format (id, title, body, link). If no results are found, an empty list is returned.
         """
         event_emitter = EventEmitter(__event_emitter__)
-
+        included_confluence_spaces, excluded_confluence_spaces = None, None
         try:
             # Convert the search type string to enum for better validation
             search_type = SearchType.from_string(type)
