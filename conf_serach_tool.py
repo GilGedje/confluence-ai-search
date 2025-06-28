@@ -5,7 +5,7 @@ repository: https://github.com/RomainNeup/open-webui-utilities
 author: @romainneup
 author_url: https://github.com/RomainNeup
 funding_url: https://github.com/sponsors/RomainNeup
-requirements: markdownify, sentence-transformers, numpy, rank_bm25, scikit-learn
+requirements: markdownify, openai, tiktoken, numpy, rank_bm25, scikit-learn
 version: 0.4.0
 changelog:
 - 0.0.1 - Initial code base.
@@ -24,6 +24,7 @@ changelog:
 - 0.2.6 - Add terms splitting option
 - 0.3.0 - Add settings for ssl verification
 - 0.4.0 - Add support for included/exluded confluence spaces in user settings
+- 0.5.0 - Replace local sentence transformers with remote OpenAI API embeddings
 """
 
 import base64
@@ -37,19 +38,12 @@ from typing import Awaitable, Callable, Dict, List, Any, Optional, Iterable
 from pydantic import BaseModel, Field
 from markdownify import markdownify
 from dataclasses import dataclass
-#from sentence_transformers import SentenceTransformer
 from rank_bm25 import BM25Okapi
 from sklearn.neighbors import NearestNeighbors
-import requests
-from typing import List, Optional
+from openai import OpenAI
+import tiktoken
 
 # Get environment variables
-DEFAULT_EMBEDDING_MODEL = os.environ.get(
-    "RAG_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
-)
-RAG_EMBEDDING_MODEL_TRUST_REMOTE_CODE = (
-    os.environ.get("RAG_EMBEDDING_MODEL_TRUST_REMOTE_CODE", "True").lower() == "true"
-)
 DEFAULT_CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "1000"))
 DEFAULT_CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", "100"))
 DEFAULT_TOP_K = int(os.environ.get("RAG_TOP_K", "3"))
@@ -60,10 +54,6 @@ RAG_FULL_CONTEXT = os.environ.get("RAG_FULL_CONTEXT", "False").lower() == "true"
 # Memory management settings
 MAX_PAGE_SIZE = int(os.environ.get("RAG_FILE_MAX_SIZE", "10000"))
 BATCH_SIZE = int(os.environ.get("RAG_FILE_MAX_COUNT", "16"))
-
-# Read cache dir from environment
-CACHE_DIR = os.environ.get("CACHE_DIR", "/tmp/cache")
-DEFAULT_MODEL_CACHE_DIR = os.path.join(CACHE_DIR, "sentence_transformers")
 
 # Additional constant values
 DEFAULT_RRF_CONSTANT = 60
@@ -85,51 +75,10 @@ BATCH_SIZE_MIN = 1
 BATCH_SIZE_MAX = 100
 
 # Default Confluence API related constants
-DEFAULT_BASE_URL = "https://confluence.gedje.space"
-DEFAULT_USERNAME = "gilgedje"
-DEFAULT_API_KEY = "MDc1ODA4NjI2NDUxOrKV3CERXStclmGTP0+5TAx1BCGG"
+DEFAULT_BASE_URL = "https://example.atlassian.net/wiki"
+DEFAULT_USERNAME = "example@example.com"
+DEFAULT_API_KEY = "ABCD1234"
 DEFAULT_API_RESULT_LIMIT = 5
-
-
-class RemoteEmbeddingClient:
-    """
-    Client for an external embedding service with OpenAI-compatible API.
-    """
-
-    def __init__(
-        self,
-        api_url: str,
-        model: str,
-        headers: Optional[dict] = None,
-        timeout: int = 30,
-    ):
-        # e.g. api_url="http://10.0.5.13:8000", model="all-MiniLM-L6-v2"
-        self.api_url = api_url.rstrip("/")
-        self.model = model
-        self.headers = headers or {"Content-Type": "application/json"}
-        self.timeout = timeout
-
-    def embed_texts(self, texts: List[str]) -> List[List[float]]:
-        """
-        Send a batch of texts to the embedding endpoint.
-        Returns a list of embedding vectors.
-        """
-        payload = {"model": self.model, "input": texts}
-        resp = requests.post(
-            f"{self.api_url}/v1/embeddings",
-            json=payload,
-            headers=self.headers,
-            timeout=self.timeout,
-        )
-        resp.raise_for_status()
-        body = resp.json()
-        return [item["embedding"] for item in body.get("data", [])]
-
-    def embed_query(self, query: str) -> List[float]:
-        """
-        Convenience for single-item embedding.
-        """
-        return self.embed_texts([query])[0]
 
 
 # Custom exceptions for better error handling
@@ -335,49 +284,77 @@ def filter_similar_embeddings(
 
 
 class DenseRetriever:
-    """Semantic search using a remote embedding service + KNN."""
+    """Semantic search using document embeddings"""
 
     def __init__(
         self,
-        client: RemoteEmbeddingClient,
-        documents: List[Document],
-        n_neighbors: int = 5,
-        **nn_kwargs,
+        embedding_function: Callable[[List[str]], np.ndarray],
+        num_results: int = DEFAULT_TOP_K,
+        similarity_threshold: float = DEFAULT_RELEVANCE_THRESHOLD,
+        batch_size: int = BATCH_SIZE,
     ):
-        self.client = client
-        self.n_neighbors = n_neighbors
-        self.nn_kwargs = nn_kwargs
-        self.documents = []
-        self.embeddings = None
-        self.nn = None
-        if documents:
-            self.add_documents(documents)
+        self.embedding_function = embedding_function
+        self.num_results = num_results
+        self.similarity_threshold = similarity_threshold
+        self.batch_size = batch_size
+        self.knn = None
+        self.documents = None
+        self.document_embeddings = None
 
     def add_documents(self, documents: List[Document]):
-        """Rebuild index for a new set of documents."""
+        """Process documents and prepare embeddings for search"""
         self.documents = documents
-        texts = []
-        for doc in documents:
-            if hasattr(doc, 'text') and doc.text:
-                texts.append(doc.text)
-            elif hasattr(doc, 'page_content') and doc.page_content:
-                texts.append(doc.page_content)
-            elif hasattr(doc, 'title') and doc.title:
-                texts.append(doc.title)
-            else:
-                texts.append("")
-        self.embeddings = self.client.embed_texts(texts)
-        self.nn = NearestNeighbors(n_neighbors=self.n_neighbors, **self.nn_kwargs).fit(
-            self.embeddings
+
+        # Process documents in batches to avoid memory issues
+        all_embeddings = []
+        for i in range(0, len(documents), self.batch_size):
+            batch = documents[i : i + self.batch_size]
+            batch_texts = [doc.page_content for doc in batch]
+            batch_embeddings = self.embedding_function(batch_texts)
+            all_embeddings.append(batch_embeddings)
+
+        # Concatenate all batches
+        self.document_embeddings = (
+            np.vstack(all_embeddings) if all_embeddings else np.array([])
         )
 
+        # Create KNN index
+        self.knn = NearestNeighbors(n_neighbors=min(self.num_results, len(documents)))
+        if len(self.document_embeddings) > 0:
+            self.knn.fit(self.document_embeddings)
+
     def get_relevant_documents(self, query: str) -> List[Document]:
-        """Embed the query remotely and fetch top-K docs."""
-        if not self.nn or not self.documents:
+        """Find documents most relevant to the query using semantic similarity"""
+        if not self.knn or not self.documents:
             return []
-        q_emb = self.client.embed_query(query)
-        distances, indices = self.nn.kneighbors([q_emb])
-        return [self.documents[i] for i in indices[0]]
+
+        query_embedding = self.embedding_function([query])[0]
+
+        _, neighbor_indices = self.knn.kneighbors(query_embedding.reshape(1, -1))
+        neighbor_indices = neighbor_indices.squeeze(0)
+
+        # Handle case where we have fewer documents than k
+        if len(neighbor_indices) == 0:
+            return []
+
+        relevant_doc_embeddings = self.document_embeddings[neighbor_indices]
+
+        # Remove duplicative content
+        included_idxs = filter_similar_embeddings(
+            relevant_doc_embeddings,
+            cosine_similarity,
+            threshold=DEFAULT_DUPLICATE_THRESHOLD,
+        )
+        relevant_doc_embeddings = relevant_doc_embeddings[included_idxs]
+
+        # Only include sufficiently relevant documents
+        similarity = cosine_similarity([query_embedding], relevant_doc_embeddings)[0]
+        similar_enough = np.where(similarity > self.similarity_threshold)[0]
+        included_idxs = [included_idxs[i] for i in similar_enough]
+
+        filtered_result_indices = neighbor_indices[included_idxs]
+
+        return [self.documents[i] for i in filtered_result_indices]
 
 
 def default_preprocessing_func(text: str) -> List[str]:
@@ -467,35 +444,74 @@ class ConfluenceDocumentRetriever:
 
     def __init__(
         self,
-        model_cache_dir: str = DEFAULT_MODEL_CACHE_DIR,
-        device: str = "cpu",
-        api_url: str = "http://10.0.5.13:8000",
-        embedding_model_name: str = "bge-m3",
+        openai_api_key: str,
+        openai_api_base: str = "https://api.openai.com/v1",
+        embedding_model_name: str = "text-embedding-ada-002",
         batch_size: int = BATCH_SIZE,
     ):
-        self.device = device
-        self.model_cache_dir = model_cache_dir
-        self.embedding_model = None
+        self.openai_api_key = (
+            openai_api_key or "dummy-key"
+        )  # Use dummy key for local servers
+        self.openai_api_base = openai_api_base
         self.embedding_model_name = embedding_model_name
         self.batch_size = batch_size
         self.text_splitter = TextSplitter(
             chunk_size=DEFAULT_CHUNK_SIZE, chunk_overlap=DEFAULT_CHUNK_OVERLAP
         )
-        self.embedding_client = RemoteEmbeddingClient(
-            api_url=api_url,
-            model=embedding_model_name
+
+        # Initialize OpenAI client with the new syntax
+        self.client = OpenAI(api_key=self.openai_api_key, base_url=self.openai_api_base)
+
+    async def load_embedding_model(self, event_emitter):
+        """Validate OpenAI API connection"""
+        await event_emitter.emit_status(
+            f"Connecting to embedding server at {self.openai_api_base} for model {self.embedding_model_name}...",
+            False,
         )
-        
 
-    async def load_embedding_model(self, *args, **kwargs):
-        # no local model to load
-        return
+        try:
+            # Test the connection with a simple embedding request
+            response = await asyncio.to_thread(
+                self.client.embeddings.create,
+                input="test",
+                model=self.embedding_model_name,
+            )
+            await event_emitter.emit_status(
+                f"Successfully connected to embedding server", False
+            )
+            return True
+        except Exception as e:
+            raise ConfluenceModelError(
+                f"Failed to connect to embedding server: {str(e)}"
+            )
 
-    def embed_texts(self, texts: List[str]) -> List[List[float]]:
-        return self.embedding_client.embed_texts(texts)
+    def get_embeddings(self, texts: List[str]) -> np.ndarray:
+        """Get embeddings from OpenAI-compatible API"""
+        embeddings = []
 
-    def embed_query(self, query: str) -> List[float]:
-        return self.embedding_client.embed_query(query)
+        # Process in batches to respect API limits
+        for i in range(0, len(texts), self.batch_size):
+            batch = texts[i : i + self.batch_size]
+
+            # For local models like BGE-M3, we might not need to truncate as strictly
+            # but we'll keep some reasonable limit
+            truncated_batch = []
+            max_chars = 8000  # Reasonable limit for most models
+
+            for text in batch:
+                if len(text) > max_chars:
+                    truncated_batch.append(text[:max_chars])
+                else:
+                    truncated_batch.append(text)
+
+            response = self.client.embeddings.create(
+                input=truncated_batch, model=self.embedding_model_name
+            )
+
+            batch_embeddings = [item.embedding for item in response.data]
+            embeddings.extend(batch_embeddings)
+
+        return np.array(embeddings)
 
     async def retrieve_from_confluence_pages(
         self,
@@ -532,24 +548,15 @@ class ConfluenceDocumentRetriever:
         # Semantic search with embeddings
         if ensemble_weighting > 0:
             await event_emitter.emit_status(
-                f"Analyzing content meaning in batches of {self.batch_size}...", False
+                f"Analyzing content meaning using {self.embedding_model_name} embeddings...",
+                False,
             )
-            client = RemoteEmbeddingClient(
-                api_url="http://10.0.5.13:8000", model="bge-m3"
+            dense_retriever = DenseRetriever(
+                embedding_function=self.get_embeddings,
+                num_results=num_results,
+                similarity_threshold=similarity_threshold,
+                batch_size=self.batch_size,
             )
-            dense_retriever = (
-                DenseRetriever(
-                    client=client,
-                    documents=documents,  # your List[Document]
-                    n_neighbors=num_results,  # how many hits you want
-                    # any extra NearestNeighbors args:
-                    algorithm="auto",
-                    metric="cosine",
-                ),
-            )
-            # Unpack if tuple with one value
-            if isinstance(dense_retriever, tuple) and len(dense_retriever) == 1:
-                dense_retriever = dense_retriever[0]
             dense_retriever.add_documents(chunked_docs)
             dense_results = dense_retriever.get_relevant_documents(query)
             await event_emitter.emit_status(
@@ -703,28 +710,11 @@ class Confluence:
     def authenticate(
         self, username: str, api_key: str, api_key_auth: bool
     ) -> Dict[str, str]:
-        """Try both authentication methods and return the one that succeeds, or raise 401 if both fail."""
-        base_url = getattr(self, 'base_url', DEFAULT_BASE_URL)
-        ssl_verify = getattr(self, 'ssl_verify', True)
-        # Try API key auth first
-        api_key_headers = self.authenticate_api_key(username, api_key)
-        test_url = f"{base_url}/rest/api/space"
-        try:
-            resp = requests.get(test_url, headers=api_key_headers, verify=ssl_verify)
-            if resp.status_code == 200:
-                return api_key_headers
-        except Exception:
-            pass
-        # Try personal access token
-        pat_headers = self.authenticate_personal_access_token(api_key)
-        try:
-            resp = requests.get(test_url, headers=pat_headers, verify=ssl_verify)
-            if resp.status_code == 200:
-                return pat_headers
-        except Exception:
-            pass
-        # If both fail, raise 401
-        raise ConfluenceAuthError("Authentication failed. Check your credentials.")
+        """Set up authentication based on configuration"""
+        if api_key_auth:
+            return self.authenticate_api_key(username, api_key)
+        else:
+            return self.authenticate_personal_access_token(api_key)
 
 
 class Tools:
@@ -752,15 +742,18 @@ class Tools:
             description="Maximum number of pages to retrieve from Confluence API",
             required=True,
         )
-        embedding_model_save_path: str = Field(
-            DEFAULT_MODEL_CACHE_DIR,
-            description="Path to the folder in which embedding models will be saved",
+        openai_api_key: str = Field(
+            "",
+            description="OpenAI API key for embeddings (leave empty if using a local embedding server)",
+        )
+        openai_api_base: str = Field(
+            "https://api.openai.com/v1",
+            description="OpenAI API base URL (change this to your local embedding server URL, e.g., http://10.0.5.13:8000/v1)",
         )
         embedding_model_name: str = Field(
-            DEFAULT_EMBEDDING_MODEL,
-            description="Name or path of the embedding model to use",
+            "text-embedding-ada-002",
+            description="Embedding model name (e.g., text-embedding-ada-002, bge-m3, etc.)",
         )
-        cpu_only: bool = Field(default=True, description="Run the tool on CPU only")
         chunk_size: int = Field(
             default=DEFAULT_CHUNK_SIZE,
             description="Max. chunk size for Confluence pages",
@@ -863,7 +856,7 @@ class Tools:
         :return: A list of search results from Confluence in JSON format (id, title, body, link). If no results are found, an empty list is returned.
         """
         event_emitter = EventEmitter(__event_emitter__)
-        included_confluence_spaces, excluded_confluence_spaces = None, None
+
         try:
             # Convert the search type string to enum for better validation
             search_type = SearchType.from_string(type)
@@ -898,6 +891,8 @@ class Tools:
                 api_key = self.valves.api_key
                 api_key_auth = True
                 split_terms = True
+                included_confluence_spaces = None
+                excluded_confluence_spaces = None
 
             if (api_key_auth and not api_username) or not api_key:
                 await event_emitter.emit_status(
@@ -912,35 +907,35 @@ class Tools:
             MAX_PAGE_SIZE = self.valves.max_page_size
             BATCH_SIZE = self.valves.batch_size
 
-            # Ensure cache directory exists
-            model_cache_dir = (
-                self.valves.embedding_model_save_path or DEFAULT_MODEL_CACHE_DIR
-            )
-            try:
-                os.makedirs(model_cache_dir, exist_ok=True)
-            except Exception as e:
-                await event_emitter.emit_status(
-                    f"Error creating model cache directory: {str(e)}", True, True
-                )
-                return f"Error: {str(e)}"
-
-            # Initialize document retriever and load model with proper error handling
+            # Initialize document retriever and validate embedding server connection
             try:
                 if not self.document_retriever:
+                    # Check if we have either an API key OR a custom base URL (for local servers)
+                    if (
+                        not self.valves.openai_api_key
+                        and self.valves.openai_api_base == "https://api.openai.com/v1"
+                    ):
+                        await event_emitter.emit_status(
+                            "Please provide an OpenAI API key or configure a custom embedding server URL.",
+                            True,
+                            True,
+                        )
+                        return "Error: OpenAI API key is required for OpenAI embeddings, or configure a custom embedding server URL."
+
                     self.document_retriever = ConfluenceDocumentRetriever(
-                        model_cache_dir=model_cache_dir,
-                        device="cpu" if self.valves.cpu_only else "cuda",
+                        openai_api_key=self.valves.openai_api_key,
+                        openai_api_base=self.valves.openai_api_base,
                         embedding_model_name=self.valves.embedding_model_name,
                         batch_size=BATCH_SIZE,
                     )
 
-                if not self.document_retriever.embedding_model:
-                    await self.document_retriever.load_embedding_model(event_emitter)
+                # Test connection to embedding server
+                await self.document_retriever.load_embedding_model(event_emitter)
             except Exception as e:
                 await event_emitter.emit_status(
-                    f"Error loading embedding model: {str(e)}", True, True
+                    f"Error connecting to embedding server: {str(e)}", True, True
                 )
-                return f"Error: Failed to load embedding model: {str(e)}"
+                return f"Error: Failed to connect to embedding server: {str(e)}"
 
             # Create Confluence client with proper error handling
             try:
