@@ -7,7 +7,7 @@ original_author_url: https://github.com/RomainNeup
 author: Gil Gedje
 author_note: This tool is a branch of the original author's work with added reranking and relevance scoring features
 funding_url: https://github.com/sponsors/RomainNeup
-requirements: markdownify, openai, tiktoken, numpy, rank_bm25, scikit-learn, requests
+requirements: markdownify, openai, numpy, rank_bm25, scikit-learn, requests
 version: 0.6.1
 changelog:
 - 0.0.1 - Initial code base.
