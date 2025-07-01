@@ -4,9 +4,9 @@ description: This tool allows you to search for and retrieve content from Conflu
 repository: https://github.com/RomainNeup/open-webui-utilities
 original_author: @romainneup
 original_author_url: https://github.com/RomainNeup
-author: Gil Gedje
+editing_author: Gil Gedje
 author_note: This tool is a branch of the original author's work with added reranking and relevance scoring features
-funding_url: https://github.com/sponsors/RomainNeup
+repository_url: https://github.com/GilGedje/confluence-ai-search.git
 requirements: markdownify, openai, numpy, rank_bm25, scikit-learn, requests
 version: 0.6.1
 changelog:
