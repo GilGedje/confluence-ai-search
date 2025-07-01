@@ -1,2 +1,6 @@
-markdownify
+arkdownify
+openai
+numpy
 rank_bm25
+scikit-learn
+requests
