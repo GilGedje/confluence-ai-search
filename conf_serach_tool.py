@@ -1,12 +1,14 @@
 """
-title: Confluence search
-description: This tool allows you to search for and retrieve content from Confluence.
+title: Confluence search with Reranking
+description: This tool allows you to search for and retrieve content from Confluence with advanced reranking capabilities.
 repository: https://github.com/RomainNeup/open-webui-utilities
-author: @romainneup
-author_url: https://github.com/RomainNeup
+original_author: @romainneup
+original_author_url: https://github.com/RomainNeup
+author: Gil Gedje
+author_note: This tool is a branch of the original author's work with added reranking and relevance scoring features
 funding_url: https://github.com/sponsors/RomainNeup
-requirements: markdownify, openai, tiktoken, numpy, rank_bm25, scikit-learn
-version: 0.4.0
+requirements: markdownify, openai, tiktoken, numpy, rank_bm25, scikit-learn, requests
+version: 0.6.1
 changelog:
 - 0.0.1 - Initial code base.
 - 0.0.2 - Fix Valves variables
@@ -23,8 +25,10 @@ changelog:
 - 0.2.5 - Code structure improvements: search type enum, and better error handling
 - 0.2.6 - Add terms splitting option
 - 0.3.0 - Add settings for ssl verification
-- 0.4.0 - Add support for included/exluded confluence spaces in user settings
+- 0.4.0 - Add support for included/excluded confluence spaces in user settings
 - 0.5.0 - Replace local sentence transformers with remote OpenAI API embeddings
+- 0.6.0 - Add reranking support with cross-encoder models (Gil Gedje)
+- 0.6.1 - Add minimum relevance score filtering and display scores in citations (Gil Gedje)
 """
 
 import base64
@@ -34,14 +38,14 @@ import asyncio
 import numpy as np
 import os
 from enum import Enum
-from typing import Awaitable, Callable, Dict, List, Any, Optional, Iterable
+from typing import Awaitable, Callable, Dict, List, Any, Optional, Iterable, Tuple
 from pydantic import BaseModel, Field
 from markdownify import markdownify
 from dataclasses import dataclass
 from rank_bm25 import BM25Okapi
 from sklearn.neighbors import NearestNeighbors
 from openai import OpenAI
-import tiktoken
+
 
 # Get environment variables
 DEFAULT_CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "1000"))
@@ -137,7 +141,6 @@ class EventEmitter:
 
     def __init__(self, event_emitter: Callable[[dict], Awaitable[None]]):
         self.event_emitter = event_emitter
-        pass
 
     async def emit_status(self, description: str, done: bool, error: bool = False):
         await self.event_emitter(
@@ -448,6 +451,7 @@ class ConfluenceDocumentRetriever:
         openai_api_base: str = "https://api.openai.com/v1",
         embedding_model_name: str = "text-embedding-ada-002",
         batch_size: int = BATCH_SIZE,
+        reranker: Optional["Reranker"] = None,  # Use string annotation
     ):
         self.openai_api_key = (
             openai_api_key or "dummy-key"
@@ -455,6 +459,7 @@ class ConfluenceDocumentRetriever:
         self.openai_api_base = openai_api_base
         self.embedding_model_name = embedding_model_name
         self.batch_size = batch_size
+        self.reranker = reranker  # Store the reranker
         self.text_splitter = TextSplitter(
             chunk_size=DEFAULT_CHUNK_SIZE, chunk_overlap=DEFAULT_CHUNK_OVERLAP
         )
@@ -522,6 +527,7 @@ class ConfluenceDocumentRetriever:
         similarity_threshold: float = DEFAULT_RELEVANCE_THRESHOLD,
         ensemble_weighting: float = 0.5,
         enable_hybrid_search: bool = ENABLE_HYBRID_SEARCH,
+        minimum_relevance_score: float = 0.7,
     ) -> List[Document]:
         """Find relevant document chunks from Confluence pages using semantic and keyword search"""
         if not documents:
@@ -587,7 +593,294 @@ class ConfluenceDocumentRetriever:
             weights=[ensemble_weighting, 1 - ensemble_weighting],
         )
 
+        # Apply reranking if enabled and reranker is available
+        if self.reranker and results:
+            await event_emitter.emit_status(
+                f"Reranking {len(results[:num_results])} results for better relevance...",
+                False,
+            )
+            try:
+                # Rerank the top results
+                results_to_rerank = results[
+                    : min(num_results * 2, len(results))
+                ]  # Rerank 2x the requested results
+
+                # Get reranked results with scores
+                reranked_results, scores = await asyncio.to_thread(
+                    self.reranker.rerank_with_scores,
+                    query,
+                    results_to_rerank,
+                    None,  # Don't limit here, we'll filter by score instead
+                )
+
+                # Filter results by minimum relevance score
+                filtered_results = []
+                filtered_count = 0
+
+                for doc, score in zip(reranked_results, scores):
+                    if score >= minimum_relevance_score:
+                        # Add the relevance score to the document metadata
+                        doc.metadata["relevance_score"] = (
+                            score * 100
+                        )  # Store as percentage
+                        filtered_results.append(doc)
+                    else:
+                        filtered_count += 1
+
+                    # Stop if we have enough results
+                    if len(filtered_results) >= num_results:
+                        break
+
+                if filtered_count > 0:
+                    await event_emitter.emit_status(
+                        f"Filtered out {filtered_count} chunks below {minimum_relevance_score*100:.0f}% relevance threshold",
+                        False,
+                    )
+
+                await event_emitter.emit_status(
+                    f"Selected {len(filtered_results)} highly relevant sections",
+                    False,
+                )
+                return filtered_results
+            except Exception as e:
+                await event_emitter.emit_status(
+                    f"Reranking failed, using original ranking: {str(e)}", False, False
+                )
+                # Fall back to original results
+
         return results[:num_results]
+
+
+class Reranker:
+    """Reranking using OpenAI-compatible API for cross-encoder models"""
+
+    def __init__(
+        self,
+        api_key: str,
+        api_base: str,
+        model_name: str,
+    ):
+        self.api_key = api_key or "dummy-key"
+        self.api_base = api_base.rstrip("/")  # Remove trailing slash if present
+        self.model_name = model_name
+
+        # We'll use requests directly for the reranking endpoint
+        self.headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        # We'll try to detect the correct endpoint
+        self.rerank_endpoint = None
+
+    async def test_connection(self, event_emitter):
+        """Test the reranker connection and detect the correct endpoint"""
+        await event_emitter.emit_status(
+            f"Testing reranker connection to {self.api_base} with model {self.model_name}...",
+            False,
+        )
+
+        # Test data for reranking
+        test_data = {
+            "model": self.model_name,
+            "query": "test query",
+            "documents": ["test document"],
+        }
+
+        # Try different possible endpoints
+        endpoints_to_try = [
+            "/rerank",  # Primary endpoint
+            "/v1/rerank",  # With v1 prefix
+            "/score",  # Some vLLM setups use this
+            "/v1/score",  # With v1 prefix
+        ]
+
+        for endpoint in endpoints_to_try:
+            try:
+                response = await asyncio.to_thread(
+                    requests.post,
+                    f"{self.api_base}{endpoint}",
+                    json=test_data,
+                    headers=self.headers,
+                    timeout=5,
+                )
+
+                if response.status_code == 200:
+                    self.rerank_endpoint = endpoint
+                    await event_emitter.emit_status(
+                        f"Successfully connected to reranker server using {endpoint}",
+                        False,
+                    )
+                    return True
+                elif response.status_code == 404:
+                    continue  # Try next endpoint
+                else:
+                    # Non-404 error might indicate correct endpoint but other issue
+                    await event_emitter.emit_status(
+                        f"Endpoint {endpoint} returned status {response.status_code}: {response.text}",
+                        False,
+                    )
+
+            except requests.exceptions.Timeout:
+                continue
+            except Exception as e:
+                continue
+
+        # If no endpoint worked, try the embeddings endpoint as fallback
+        # Some reranking models are served through embeddings endpoint
+        try:
+            await event_emitter.emit_status(
+                "Trying embeddings endpoint for reranking compatibility...", False
+            )
+
+            # For embeddings endpoint, we need pairs format
+            test_embeddings_data = {
+                "model": self.model_name,
+                "input": [["test query", "test document"]],
+            }
+
+            response = await asyncio.to_thread(
+                requests.post,
+                f"{self.api_base}/v1/embeddings",
+                json=test_embeddings_data,
+                headers=self.headers,
+            )
+
+            if response.status_code == 200:
+                self.rerank_endpoint = "/v1/embeddings"
+                await event_emitter.emit_status(
+                    "Successfully connected to reranker using embeddings endpoint",
+                    False,
+                )
+                return True
+
+        except Exception as e:
+            pass
+
+        raise ConfluenceModelError(
+            f"Failed to connect to reranker server. Tried endpoints: {endpoints_to_try} and /v1/embeddings. "
+            f"Please check your vLLM server configuration."
+        )
+
+    def rerank_with_scores(
+        self, query: str, documents: List[Document], top_k: int = None
+    ) -> Tuple[List[Document], List[float]]:
+        """Rerank documents and return both documents and their scores"""
+        if not documents:
+            return [], []
+
+        if not self.rerank_endpoint:
+            raise Exception(
+                "Reranker endpoint not initialized. Call test_connection first."
+            )
+
+        scores = []
+
+        # Process in batches to avoid overwhelming the API
+        batch_size = 32
+
+        for i in range(0, len(documents), batch_size):
+            batch_docs = documents[i : i + batch_size]
+
+            try:
+                if self.rerank_endpoint == "/v1/embeddings":
+                    # Special handling for embeddings endpoint
+                    pairs = [[query, doc.page_content] for doc in batch_docs]
+
+                    data = {"model": self.model_name, "input": pairs}
+
+                    response = requests.post(
+                        f"{self.api_base}{self.rerank_endpoint}",
+                        json=data,
+                        headers=self.headers,
+                    )
+
+                    if response.status_code != 200:
+                        raise Exception(
+                            f"Reranker API error: {response.status_code} - {response.text}"
+                        )
+
+                    result = response.json()
+
+                    # Extract scores from embeddings response
+                    batch_scores = []
+                    for item in result.get("data", []):
+                        embedding = item.get("embedding", [])
+                        score = embedding[0] if embedding else 0.0
+                        batch_scores.append(score)
+
+                else:
+                    # Standard reranking endpoint format (Jina AI compatible)
+                    doc_texts = [doc.page_content for doc in batch_docs]
+
+                    data = {
+                        "model": self.model_name,
+                        "query": query,
+                        "documents": doc_texts,
+                        "top_n": len(doc_texts),
+                    }
+
+                    response = requests.post(
+                        f"{self.api_base}{self.rerank_endpoint}",
+                        json=data,
+                        headers=self.headers,
+                    )
+
+                    if response.status_code != 200:
+                        raise Exception(
+                            f"Reranker API error: {response.status_code} - {response.text}"
+                        )
+
+                    result = response.json()
+
+                    # Log the raw response for debugging
+                    print(f"Reranker raw response: {json.dumps(result, indent=2)}")
+
+                    # Extract scores from response (Jina AI format)
+                    if "results" in result:
+                        # Jina AI format returns results with index and relevance_score
+                        batch_scores = [0.0] * len(batch_docs)
+                        for item in result["results"]:
+                            idx = item.get("index", 0)
+                            score = item.get("relevance_score", 0.0)
+                            if idx < len(batch_scores):
+                                batch_scores[idx] = score
+                    elif "scores" in result:
+                        batch_scores = result["scores"]
+                    elif "data" in result:
+                        batch_scores = [
+                            item.get("score", 0.0) for item in result["data"]
+                        ]
+                    else:
+                        raise Exception(f"Unknown response format: {result}")
+
+                scores.extend(batch_scores)
+
+            except Exception as e:
+                # If reranking fails, log and return original order
+                print(f"Reranking error: {str(e)}")
+                return documents[:top_k] if top_k else documents, []
+
+        # Sort documents by score in descending order
+        scored_docs = list(zip(scores, documents))
+        scored_docs.sort(key=lambda x: x[0], reverse=True)
+
+        # Separate scores and documents
+        sorted_scores = [score for score, _ in scored_docs]
+        sorted_docs = [doc for _, doc in scored_docs]
+
+        # Return top_k documents and their scores
+        if top_k:
+            return sorted_docs[:top_k], sorted_scores[:top_k]
+        return sorted_docs, sorted_scores
+
+    def rerank(
+        self, query: str, documents: List[Document], top_k: int = None
+    ) -> List[Document]:
+        """Rerank documents based on relevance to query"""
+        # Simply call rerank_with_scores and return only the documents
+        docs, _ = self.rerank_with_scores(query, documents, top_k)
+        return docs
 
 
 class Confluence:
@@ -637,23 +930,33 @@ class Confluence:
         terms = query.split()
         if not terms or not split_terms:
             if field:
-                return f'{field} ~ "{query}"'
-            return f'text ~ "{query}" OR title ~ "{query}"'
-
-        if field:
-            cql_terms = " OR ".join([f'{field} ~ "{term}"' for term in terms])
+                cql_terms = f'{field} ~ "{query}"'
+            else:
+                cql_terms = f'text ~ "{query}" OR title ~ "{query}"'
         else:
-            cql_terms = " OR ".join(
-                [f'title ~ "{term}" OR text ~ "{term}"' for term in terms]
-            )
+            if field:
+                cql_terms = " OR ".join([f'{field} ~ "{term}"' for term in terms])
+            else:
+                cql_terms = " OR ".join(
+                    [f'title ~ "{term}" OR text ~ "{term}"' for term in terms]
+                )
 
+        # Default behavior: NO spaces are searched unless explicitly included
         if self.included_spaces is not None and len(self.included_spaces) > 0:
+            # Search only in the specified included spaces
             quoted_spaces = [f"'{space}'" for space in self.included_spaces]
-            cql_terms += f' AND space in ({", ".join(quoted_spaces)})'
+            cql_terms = f'({cql_terms}) AND space in ({", ".join(quoted_spaces)})'
+        else:
+            # No included spaces specified - return no results
+            # This effectively means "exclude all spaces" by default
+            return f'({cql_terms}) AND space = "NONEXISTENT_SPACE_NAME"'
 
+        # Note: excluded_spaces is now redundant since we're only searching in included spaces
+        # But we'll keep it for backwards compatibility
         if self.excluded_spaces is not None and len(self.excluded_spaces) > 0:
             quoted_excluded_spaces = [f"'{space}'" for space in self.excluded_spaces]
             cql_terms += f' AND space not in ({", ".join(quoted_excluded_spaces)})'
+
         return cql_terms
 
     def search_confluence(
@@ -807,6 +1110,35 @@ class Tools:
             ge=BATCH_SIZE_MIN,
             le=BATCH_SIZE_MAX,
         )
+        enable_reranking: bool = Field(
+            False,
+            description="Enable reranking of search results using a cross-encoder model",
+        )
+        reranker_api_key: str = Field(
+            "",
+            description="API key for reranker (leave empty to use the same as embedding server)",
+        )
+        reranker_api_base: str = Field(
+            "",
+            description="Reranker API base URL (leave empty to use the same as embedding server)",
+        )
+        reranker_model_name: str = Field(
+            "Qwen/Qwen2.5-Reranker-0.6B",
+            description="Reranker model name (e.g., Qwen/Qwen2.5-Reranker-0.6B, BAAI/bge-reranker-v2-m3)",
+        )
+        reranker_top_k: int = Field(
+            5,
+            description="Number of top results to keep after reranking",
+            ge=1,
+            le=50,
+        )
+        minimum_relevance_score: float = Field(
+            0.7,
+            description="Minimum relevance score (0-1) required for chunks to be included as context. "
+            "Only applies when reranking is enabled. Chunks below this score will be filtered out.",
+            ge=0.0,
+            le=1.0,
+        )
         pass
 
     class UserValves(BaseModel):
@@ -830,11 +1162,11 @@ class Tools:
         )
         included_confluence_spaces: str = Field(
             "",
-            description="Comma-separated list of Confluence spaces to search in; leave empty to search all spaces.",
+            description="Comma-separated list of Confluence spaces to search in. REQUIRED - No spaces will be searched if this is empty.",
         )
         excluded_confluence_spaces: str = Field(
             "",
-            description="Comma-separated list of Confluence spaces to exclude from the search; leave empty to include all spaces.",
+            description="Comma-separated list of Confluence spaces to exclude from the search (only applies to included spaces).",
         )
         pass
 
@@ -922,11 +1254,40 @@ class Tools:
                         )
                         return "Error: OpenAI API key is required for OpenAI embeddings, or configure a custom embedding server URL."
 
+                    # Initialize reranker if enabled
+                    reranker = None
+                    if self.valves.enable_reranking:
+                        # Use embedding server settings if reranker settings are not provided
+                        reranker_api_key = (
+                            self.valves.reranker_api_key or self.valves.openai_api_key
+                        )
+                        reranker_api_base = (
+                            self.valves.reranker_api_base or self.valves.openai_api_base
+                        )
+
+                        reranker = Reranker(
+                            api_key=reranker_api_key,
+                            api_base=reranker_api_base,
+                            model_name=self.valves.reranker_model_name,
+                        )
+
+                        # Test reranker connection
+                        try:
+                            await reranker.test_connection(event_emitter)
+                        except Exception as e:
+                            await event_emitter.emit_status(
+                                f"Warning: Reranker connection failed, continuing without reranking: {str(e)}",
+                                False,
+                                False,
+                            )
+                            reranker = None
+
                     self.document_retriever = ConfluenceDocumentRetriever(
                         openai_api_key=self.valves.openai_api_key,
                         openai_api_base=self.valves.openai_api_base,
                         embedding_model_name=self.valves.embedding_model_name,
                         batch_size=BATCH_SIZE,
+                        reranker=reranker,
                     )
 
                 # Test connection to embedding server
@@ -1048,6 +1409,7 @@ class Tools:
                         similarity_threshold=self.valves.similarity_threshold,
                         ensemble_weighting=self.valves.ensemble_weighting,
                         enable_hybrid_search=self.valves.enable_hybrid_search,
+                        minimum_relevance_score=self.valves.minimum_relevance_score,
                     )
                 )
 
@@ -1064,8 +1426,16 @@ class Tools:
                             "title": chunk.metadata["title"],
                             "link": chunk.metadata["source"],
                             "chunks": [],
+                            "max_score": 0.0,  # Track the highest score for this page
                         }
                     page_chunks[page_id]["chunks"].append(chunk.page_content)
+
+                    # Update max score if this chunk has a higher relevance score
+                    if "relevance_score" in chunk.metadata:
+                        page_chunks[page_id]["max_score"] = max(
+                            page_chunks[page_id]["max_score"],
+                            chunk.metadata["relevance_score"],
+                        )
 
                 # Create final results
                 results = []
@@ -1080,9 +1450,17 @@ class Tools:
                         "link": page_data["link"],
                     }
 
-                    # Add citations for each relevant chunk
+                    # Prepare citation with relevance score
+                    if page_data["max_score"] > 0:
+                        # Add relevance score at the top of the content
+                        score_header = f"**📊 Relevance Score: {page_data['max_score']:.1f}%**\n\n---\n\n"
+                        citation_body = score_header + result["body"]
+                    else:
+                        citation_body = result["body"]
+
+                    # Emit the citation
                     await event_emitter.emit_source(
-                        result["title"], result["link"], result["body"]
+                        result["title"], result["link"], citation_body
                     )
 
                     results.append(result)
