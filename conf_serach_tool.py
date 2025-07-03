@@ -1,12 +1,11 @@
 """
 title: Confluence search with Reranking
 description: This tool allows you to search for and retrieve content from Confluence.
-repository: https://github.com/RomainNeup/open-webui-utilities
+editing_author: Gil Gedje
+repository_url: https://github.com/GilGedje/confluence-ai-search.git
 original_author: @romainneup
 original_author_url: https://github.com/RomainNeup
-author: Gil Gedje
 author_note: This tool is a branch of the original author's work with added remote embedding, reranking, relevance scoring, and query expansion features
-funding_url: https://github.com/sponsors/RomainNeup
 requirements: markdownify, openai, tiktoken, numpy, rank_bm25, scikit-learn, requests
 version: 0.7.0
 changelog:
