@@ -1,14 +1,14 @@
 """
 title: Confluence search with Reranking
-description: This tool allows you to search for and retrieve content from Confluence with advanced reranking capabilities.
+description: This tool allows you to search for and retrieve content from Confluence.
 repository: https://github.com/RomainNeup/open-webui-utilities
 original_author: @romainneup
 original_author_url: https://github.com/RomainNeup
-editing_author: Gil Gedje
-author_note: This tool is a branch of the original author's work with added reranking and relevance scoring features
-repository_url: https://github.com/GilGedje/confluence-ai-search.git
-requirements: markdownify, openai, numpy, rank_bm25, scikit-learn, requests
-version: 0.6.1
+author: Gil Gedje
+author_note: This tool is a branch of the original author's work with added remote embedding, reranking, relevance scoring, and query expansion features
+funding_url: https://github.com/sponsors/RomainNeup
+requirements: markdownify, openai, tiktoken, numpy, rank_bm25, scikit-learn, requests
+version: 0.7.0
 changelog:
 - 0.0.1 - Initial code base.
 - 0.0.2 - Fix Valves variables
@@ -26,9 +26,10 @@ changelog:
 - 0.2.6 - Add terms splitting option
 - 0.3.0 - Add settings for ssl verification
 - 0.4.0 - Add support for included/excluded confluence spaces in user settings
-- 0.5.0 - Replace local sentence transformers with remote OpenAI API embeddings
+- 0.5.0 - Replace local sentence transformers with remote OpenAI API embeddings (Gil Gedje)
 - 0.6.0 - Add reranking support with cross-encoder models (Gil Gedje)
 - 0.6.1 - Add minimum relevance score filtering and display scores in citations (Gil Gedje)
+- 0.7.0 - Add LLM-powered query expansion for improved search coverage (Gil Gedje)
 """
 
 import base64
@@ -363,6 +364,176 @@ class DenseRetriever:
 def default_preprocessing_func(text: str) -> List[str]:
     """Split text into words for keyword search"""
     return text.split()
+
+
+class QueryExpander:
+    """Expands user queries into multiple search variations using LLM"""
+
+    def __init__(
+        self,
+        api_key: str,
+        api_base: str = "https://api.openai.com/v1",
+        model_name: str = "gpt-3.5-turbo",
+        max_variations: int = 3,
+        system_prompt_template: str = None,
+    ):
+        self.api_key = api_key or "dummy-key"
+        self.api_base = api_base
+        self.model_name = model_name
+        self.max_variations = max_variations
+        self.system_prompt_template = system_prompt_template
+
+        # Initialize OpenAI client
+        self.client = OpenAI(api_key=self.api_key, base_url=self.api_base)
+
+    async def test_connection(self, event_emitter):
+        """Test the LLM connection"""
+        await event_emitter.emit_status(
+            f"Testing query expansion model connection to {self.api_base}...",
+            False,
+        )
+
+        try:
+            # Test with a simple query
+            response = await asyncio.to_thread(
+                self.client.chat.completions.create,
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": "Hello"},
+                ],
+                max_tokens=10,
+                temperature=0,
+            )
+            await event_emitter.emit_status(
+                "Successfully connected to query expansion model", False
+            )
+            return True
+        except Exception as e:
+            raise ConfluenceModelError(
+                f"Failed to connect to query expansion model: {str(e)}"
+            )
+
+    async def expand_query(self, original_query: str, event_emitter) -> List[str]:
+        """Generate alternative search queries based on the original query"""
+
+        await event_emitter.emit_status(
+            "Generating alternative search queries for better results...",
+            False,
+        )
+
+        # Use the system prompt template, formatting it with max_variations
+        if self.system_prompt_template:
+            system_prompt = self.system_prompt_template.format(
+                max_variations=self.max_variations
+            )
+        else:
+            # Fallback to default prompt if none provided
+            system_prompt = f"""Generate {self.max_variations} alternative search queries for Confluence documentation search.
+
+            Rules:
+            - Return ONLY the alternative queries, one per line
+            - Keep queries 2-8 words long
+            - Use synonyms, abbreviations, or related terms
+            - Do not include explanations or numbering
+            - Do not repeat the original query
+            
+            /no_think"""
+
+        user_prompt = f"Generate {self.max_variations} alternative search queries for: {original_query}"
+
+        try:
+            print(f"\n=== Query Expansion Request ===")
+            print(f"Model: {self.model_name}")
+            print(f"Original query: '{original_query}'")
+            print(f"Requesting {self.max_variations} variations")
+
+            response = await asyncio.to_thread(
+                self.client.chat.completions.create,
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                max_tokens=150,
+                temperature=0.7,  # Some creativity for variations
+                n=1,
+            )
+
+            # Check if we have a valid response
+            if not response or not response.choices or len(response.choices) == 0:
+                print("ERROR: Invalid response structure")
+                return []
+
+            # Get the message content
+            message = response.choices[0].message
+            if not message:
+                print("ERROR: No message in response")
+                return []
+
+            content = message.content
+            if content is None:
+                print("ERROR: Message content is None")
+                return []
+
+            # Parse the response
+            content = content.strip()
+            print(f"Raw response content:\n{content}")
+
+            # Split into lines and clean up
+            variations = []
+            for line in content.split("\n"):
+                line = line.strip()
+                if line and not line.startswith("#") and not line.startswith("*"):
+                    # Additional cleanup: remove bullet points, numbers, etc.
+                    line = line.lstrip("•-123456789. ")
+                    if line and 2 <= len(line.split()) <= 10:
+                        variations.append(line)
+
+            # Limit to max_variations
+            variations = variations[: self.max_variations]
+
+            # Log the generated queries
+            print(f"\n=== Query Expansion Results ===")
+            print(f"Original Query: '{original_query}'")
+            print(f"Generated Variations ({len(variations)}):")
+            for i, var in enumerate(variations, 1):
+                print(f"  {i}. '{var}'")
+            print("==============================\n")
+
+            # Also emit to UI
+            if variations:
+                variations_list = "\n".join([f"• {var}" for var in variations])
+                await event_emitter.emit_status(
+                    f"Generated {len(variations)} alternative queries:\n{variations_list}",
+                    False,
+                )
+            else:
+                await event_emitter.emit_status(
+                    "No valid alternative queries generated, using original query only",
+                    False,
+                )
+
+            return variations
+
+        except Exception as e:
+            print(f"\n=== Query Expansion Error ===")
+            print(f"Failed to expand query '{original_query}'")
+            print(f"Error type: {type(e).__name__}")
+            print(f"Error details: {str(e)}")
+            import traceback
+
+            print(f"Traceback:\n{traceback.format_exc()}")
+            print("=============================\n")
+
+            await event_emitter.emit_status(
+                f"Query expansion failed: {str(e)}, using original query only",
+                False,
+                False,
+            )
+            return (
+                []
+            )  # Return empty list on failure, will fall back to original query only
 
 
 class BM25Retriever:
@@ -1139,6 +1310,63 @@ class Tools:
             ge=0.0,
             le=1.0,
         )
+        enable_query_expansion: bool = Field(
+            False,
+            description="Enable query expansion using LLM to generate alternative search queries",
+        )
+        query_expansion_api_key: str = Field(
+            "",
+            description="API key for query expansion LLM (leave empty to use OpenAI API key)",
+        )
+        query_expansion_api_base: str = Field(
+            "",
+            description="Query expansion LLM API base URL (leave empty to use OpenAI API base)",
+        )
+        query_expansion_model: str = Field(
+            "gpt-3.5-turbo",
+            description="LLM model for query expansion (e.g., gpt-3.5-turbo, gpt-4, llama2, etc.)",
+        )
+        query_expansion_max_variations: int = Field(
+            3,
+            description="Maximum number of alternative queries to generate",
+            ge=1,
+            le=10,
+        )
+        query_expansion_system_prompt: str = Field(
+            default="""You are a search query expansion assistant for Confluence documentation search.
+                Your task is to generate alternative search queries that will help find relevant documentation.
+                
+                Given a user's search query, generate up to {max_variations} alternative queries that:
+                1. Use synonyms and related terms
+                2. Include common abbreviations or expand abbreviations
+                3. Rephrase the query in different ways
+                4. Include related technical terms or business terms
+                5. Consider common misspellings or variations
+                
+                Rules:
+                - Keep queries concise (2-8 words preferred)
+                - Make queries specific and relevant
+                - Don't include meta-instructions or explanations
+                - Return ONLY the queries, one per line
+                - Don't repeat the original query
+                - Focus on terms likely to appear in technical/business documentation
+                
+                Examples:
+                Original: "API authentication"
+                Variations:
+                API auth
+                authentication endpoints
+                REST API security
+                
+                Original: "deploy production"
+                Variations:
+                deployment process prod
+                production deployment guide
+                release to production
+                
+                /no_think""",
+            description="System prompt for query expansion. Use {max_variations} to insert the number of variations. Include /no_think at the end for models that support it.",
+        )
         pass
 
     class UserValves(BaseModel):
@@ -1315,26 +1543,135 @@ class Tools:
                 )
                 return f"Error: Authentication failed: {str(e)}"
 
+            # Initialize query expander if enabled
+            query_expander = None
+            expanded_queries = []
+            if self.valves.enable_query_expansion:
+                # Use configured keys or fall back to OpenAI settings
+                expansion_api_key = (
+                    self.valves.query_expansion_api_key or self.valves.openai_api_key
+                )
+                expansion_api_base = (
+                    self.valves.query_expansion_api_base or self.valves.openai_api_base
+                )
+
+                if expansion_api_key:
+                    try:
+                        query_expander = QueryExpander(
+                            api_key=expansion_api_key,
+                            api_base=expansion_api_base,
+                            model_name=self.valves.query_expansion_model,
+                            max_variations=self.valves.query_expansion_max_variations,
+                            system_prompt_template=self.valves.query_expansion_system_prompt,  # Pass the system prompt
+                        )
+
+                        # Test connection
+                        await query_expander.test_connection(event_emitter)
+
+                        # Generate expanded queries
+                        expanded_queries = await query_expander.expand_query(
+                            query, event_emitter
+                        )
+                    except Exception as e:
+                        await event_emitter.emit_status(
+                            f"Query expansion initialization failed: {str(e)}, continuing with original query only",
+                            False,
+                            False,
+                        )
+                        query_expander = None
+                else:
+                    await event_emitter.emit_status(
+                        "Query expansion enabled but no API key provided, using original query only",
+                        False,
+                        False,
+                    )
+
+            # This is the section in search_confluence that performs the searches
+            # Replace the corresponding section with this enhanced version:
+
+            # Prepare all queries to search (original + expanded)
+            all_queries = [query] + expanded_queries
+            unique_page_ids = set()  # To avoid duplicate pages
+
+            # Log all queries that will be searched
+            print(f"\n=== Confluence Search Queries ===")
+            print(f"Total queries to search: {len(all_queries)}")
+            for i, q in enumerate(all_queries):
+                print(f"  Query {i+1}: '{q}'")
+            print("=================================\n")
+
             await event_emitter.emit_status(
                 f"Searching Confluence for '{query}' in {search_type.value}...", False
             )
 
-            # Search using the Confluence API
-            try:
-                searchResponse = confluence.search_confluence(
-                    query, search_type, self.valves.api_result_limit, split_terms
-                )
-            except ConfluenceAPIError as e:
-                await event_emitter.emit_status(
-                    f"API error during search: {str(e)}", True, True
-                )
-                return f"Error: Confluence API error: {str(e)}"
+            # Perform searches for all queries
+            all_search_results = []
+            for i, search_query in enumerate(all_queries):
+                if i > 0:  # For expanded queries
+                    await event_emitter.emit_status(
+                        f"Searching with alternative query: '{search_query}'...", False
+                    )
 
-            if not searchResponse:
+                try:
+                    print(
+                        f"Searching Confluence with query {i+1}/{len(all_queries)}: '{search_query}'"
+                    )
+                    searchResponse = confluence.search_confluence(
+                        search_query,
+                        search_type,
+                        self.valves.api_result_limit,
+                        split_terms,
+                    )
+
+                    print(f"  Found {len(searchResponse)} results for '{search_query}'")
+
+                    # Add only unique pages
+                    new_pages = 0
+                    for page_id in searchResponse:
+                        if page_id not in unique_page_ids:
+                            unique_page_ids.add(page_id)
+                            all_search_results.append(page_id)
+                            new_pages += 1
+
+                    print(f"  Added {new_pages} new unique pages")
+
+                except ConfluenceAPIError as e:
+                    # Log but don't fail if an expanded query fails
+                    if i == 0:  # Original query failed
+                        await event_emitter.emit_status(
+                            f"API error during search: {str(e)}", True, True
+                        )
+                        return f"Error: Confluence API error: {str(e)}"
+                    else:
+                        print(
+                            f"  ERROR: Expanded query '{search_query}' failed: {str(e)}"
+                        )
+                        await event_emitter.emit_status(
+                            f"Expanded query '{search_query}' failed: {str(e)}",
+                            False,
+                            False,
+                        )
+
+            print(f"\n=== Search Results Summary ===")
+            print(f"Total unique pages found: {len(all_search_results)}")
+            print(f"Page IDs: {all_search_results}")
+            print("==============================\n")
+
+            if not all_search_results:
                 await event_emitter.emit_status(
-                    f"No matching results found in Confluence for '{query}'", True
+                    f"No matching results found in Confluence for '{query}' and its variations",
+                    True,
                 )
                 return json.dumps([])
+
+            # Update the status message to reflect total unique results
+            await event_emitter.emit_status(
+                f"Found {len(all_search_results)} unique pages across all search queries",
+                False,
+            )
+
+            # Replace the original searchResponse with our aggregated results
+            searchResponse = all_search_results
 
             # Fetch the full content of each page found
             raw_documents = []
