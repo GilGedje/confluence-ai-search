@@ -1,199 +1,239 @@
-# Confluence Search with Reranking Tool
+# Confluence Search with Advanced RAG and Query Expansion
 
-A powerful Open WebUI tool that enables intelligent search and retrieval of content from Confluence with advanced reranking capabilities for improved relevance.
+A powerful Confluence search tool for Open WebUI with intelligent query expansion, semantic search, reranking, and advanced relevance filtering.
 
-## Features
+## 🚀 Key Features
 
-- **Smart Search**: Search by title, content, or both across your Confluence spaces
-- **RAG Processing**: Retrieval Augmented Generation for finding the most relevant content chunks
-- **Hybrid Search**: Combines semantic search (embeddings) with keyword search (BM25) for optimal results
-- **Cross-Encoder Reranking**: Uses advanced reranking models to improve result relevance
-- **Relevance Filtering**: Automatically filters out low-relevance content based on configurable thresholds
-- **Flexible Authentication**: Supports both API key and Personal Access Token authentication
-- **Memory Optimization**: Handles large Confluence pages efficiently with configurable chunking
+### **🔍 Intelligent Query Expansion (NEW in v0.7.0)**
+- **LLM-Powered Search Enhancement**: Automatically generates alternative search queries using AI
+- **Smart Variations**: Creates synonyms, abbreviations, related terms, and rephrased queries
+- **Technical Documentation Focus**: Optimized prompts for finding business and technical content
+- **Configurable**: Control number of variations (1-10) and customize the expansion model
 
-## Installation
+### **🧠 Advanced Semantic Search**
+- **Remote Embeddings**: OpenAI-compatible API for embeddings (supports local models)
+- **Hybrid Search**: Combines semantic similarity with keyword matching (BM25)
+- **Smart Chunking**: Breaks large documents into optimal-sized sections with overlap
+- **Relevance Filtering**: Configurable similarity thresholds to filter irrelevant results
 
-### Requirements
+### **📊 Intelligent Reranking**
+- **Cross-Encoder Models**: Advanced reranking using models like Qwen2.5-Reranker or BGE-Reranker
+- **Relevance Scoring**: Display confidence scores for each result
+- **Quality Filtering**: Filter out low-relevance chunks automatically
+- **Multiple Model Support**: Compatible with various reranking APIs
+
+### **⚡ Performance & Reliability**
+- **Memory Optimization**: Batch processing and smart memory management
+- **Error Handling**: Robust error recovery and fallback mechanisms
+- **Space Control**: Include/exclude specific Confluence spaces
+- **SSL & Authentication**: Support for API keys and Personal Access Tokens
+
+## 🎯 How Query Expansion Works
+
+When you search for **"API authentication"**, the system:
+
+1. **Original Search**: Searches Confluence with "API authentication"
+2. **AI Enhancement**: Generates variations like:
+   - "API auth"
+   - "REST API security" 
+   - "authentication endpoints"
+   - "API token configuration"
+3. **Multi-Query Search**: Searches with each variation
+4. **Smart Aggregation**: Combines unique results from all searches
+5. **Relevance Ranking**: Returns the most relevant content
+
+This dramatically improves search coverage and finds content you might otherwise miss!
+
+## 📋 Requirements
 
 ```
 markdownify
 openai
+tiktoken
 numpy
 rank_bm25
 scikit-learn
 requests
 ```
 
-### Setup
+## ⚙️ Configuration
 
-1. Install the tool in your Open WebUI instance
-2. Configure the admin valves (see Configuration section)
-3. Users can override settings with their own credentials
+### **Global Settings (Valves)**
 
-## Configuration
+#### **Basic Confluence Settings**
+- `base_url`: Your Confluence instance URL
+- `username`: Default username/email
+- `api_key`: Default API key or Personal Access Token
+- `ssl_verify`: Enable/disable SSL verification
+- `api_result_limit`: Max pages to retrieve from Confluence API
 
-### Admin Configuration (Valves)
+#### **Embedding & AI Settings**
+- `openai_api_key`: API key for embeddings (leave empty for local servers)
+- `openai_api_base`: Embedding server URL (e.g., `http://localhost:8000/v1`)
+- `embedding_model_name`: Model name (e.g., `text-embedding-ada-002`, `your-embedding-model`)
 
-Administrators can set default values that apply to all users:
+#### **🆕 Query Expansion Settings**
+- `enable_query_expansion`: Enable AI-powered query expansion
+- `query_expansion_api_key`: API key for expansion LLM (uses OpenAI key if empty)
+- `query_expansion_api_base`: LLM server URL (uses OpenAI base if empty)
+- `query_expansion_model`: Model for expansion (e.g., `gpt-3.5-turbo`, `your-llm-model`)
+- `query_expansion_max_variations`: Number of alternative queries (1-10)
+- `query_expansion_system_prompt`: Custom prompt template for query generation
 
-#### Confluence Settings
-- **`base_url`**: Your Confluence instance URL (e.g., `https://company.atlassian.net/wiki`)
-- **`ssl_verify`**: Enable/disable SSL verification (default: `true`)
-- **`username`**: Default username for API authentication
-- **`api_key`**: Default API key or Personal Access Token
-- **`api_result_limit`**: Maximum pages to retrieve from Confluence API (default: `5`)
+#### **Reranking Settings**
+- `enable_reranking`: Enable cross-encoder reranking
+- `reranker_api_key`: Reranker API key (uses embedding key if empty)
+- `reranker_api_base`: Reranker server URL (uses embedding base if empty)
+- `reranker_model_name`: Reranker model (e.g., `your-reranker-model`)
+- `minimum_relevance_score`: Filter threshold for relevance (0-1)
 
-#### Embedding Settings
-- **`openai_api_key`**: API key for OpenAI embeddings (leave empty for local servers)
-- **`openai_api_base`**: Embedding server URL (default: `https://api.openai.com/v1`)
-  - For local servers: `http://your-server:8000/v1`
-- **`embedding_model_name`**: Model to use for embeddings (e.g., `text-embedding-ada-002`, `bge-m3`)
+#### **RAG Processing Settings**
+- `chunk_size`: Maximum chunk size for documents (default: 1000)
+- `chunk_overlap`: Overlap between chunks (default: 100)
+- `max_results`: Number of relevant chunks to return (default: 3)
+- `similarity_threshold`: Minimum similarity score for chunks
+- `ensemble_weighting`: Balance between semantic (1.0) and keyword (0.0) search
+- `enable_hybrid_search`: Enable combined semantic + keyword search
+- `full_context`: Return complete pages instead of relevant chunks
 
-#### RAG Processing Settings
-- **`chunk_size`**: Maximum chunk size for splitting pages (default: `1000`)
-- **`chunk_overlap`**: Overlap between chunks for context preservation (default: `100`)
-- **`max_results`**: Maximum relevant chunks to return (default: `3`)
-- **`similarity_threshold`**: Minimum similarity score for semantic search (default: `0.0`)
-- **`ensemble_weighting`**: Balance between semantic and keyword search (default: `0.5`)
-  - `0.0` = Pure keyword search
-  - `1.0` = Pure semantic search
-- **`enable_hybrid_search`**: Enable/disable hybrid search (default: from environment)
-- **`full_context`**: Return complete pages instead of chunks (default: `false`)
+### **User Settings (UserValves)**
 
-#### Reranking Settings
-- **`enable_reranking`**: Enable cross-encoder reranking (default: `false`)
-- **`reranker_api_key`**: API key for reranker (defaults to embedding API key)
-- **`reranker_api_base`**: Reranker server URL (defaults to embedding server)
-- **`reranker_model_name`**: Reranking model (e.g., `Qwen/Qwen2.5-Reranker-0.6B`)
-- **`reranker_top_k`**: Number of results to keep after reranking (default: `5`)
-- **`minimum_relevance_score`**: Minimum score (0-1) for chunks to be included (default: `0.7`)
-  - Only applies when reranking is enabled
-  - `0.7` = 70% relevance threshold
+- `api_key_auth`: Use API key vs Personal Access Token
+- `username`: User-specific username (overrides global)
+- `api_key`: User-specific API key (overrides global)
+- `split_terms`: Split search queries into individual words
+- `included_confluence_spaces`: **REQUIRED** - Comma-separated spaces to search
+- `excluded_confluence_spaces`: Spaces to exclude from search
 
-#### Memory Management
-- **`max_page_size`**: Maximum characters per Confluence page (default: `10000`)
-- **`batch_size`**: Documents to process at once for embeddings (default: `16`)
+## 🔧 Setup Instructions
 
-### User Configuration (UserValves)
+### **1. Basic Setup**
+1. Install the tool in Open WebUI
+2. Configure your Confluence URL and credentials in Global Settings
+3. **Important**: Set `included_confluence_spaces` in User Settings (required)
 
-Individual users can override admin settings with their own values:
+### **2. Embedding Server Setup**
 
-#### Authentication
-- **`api_key_auth`**: Use API key authentication (default: `true`)
-  - Set to `false` to use Personal Access Token
-- **`username`**: Your Confluence username/email
-  - Leave empty for Personal Access Token auth
-- **`api_key`**: Your API key or Personal Access Token
-
-#### Search Settings
-- **`split_terms`**: Split search queries into words (default: `true`)
-  - Improves search results for multi-word queries
-- **`included_confluence_spaces`**: Comma-separated list of spaces to search
-  - **REQUIRED**: No spaces will be searched if empty
-  - Example: `TECH,DOCS,KB`
-- **`excluded_confluence_spaces`**: Spaces to exclude from search
-  - Only applies to included spaces
-  - Example: `ARCHIVE,OLD`
-
-## Usage
-
-### Basic Search
-
-To search Confluence, use natural language queries like:
-- "Search Confluence for project documentation"
-- "Find pages about API integration in Confluence"
-- "Look for deployment guides"
-
-### Search Types
-
-The tool will automatically detect the appropriate search type:
-- **Title search**: When looking for specific page titles
-- **Content search**: When searching within page content
-- **Combined search**: Default behavior for general queries
-
-### Understanding Results
-
-#### With Reranking Enabled
-Each result shows a relevance score:
-```
-📊 Relevance Score: 92.3%
----
-[Content follows...]
+#### **Option A: OpenAI**
+```python
+openai_api_key = "sk-your-openai-api-key"
+openai_api_base = "https://api.openai.com/v1"
+embedding_model_name = "text-embedding-ada-002"
 ```
 
-#### Relevance Scores
-- **90-100%**: Highly relevant - exact match to your query
-- **70-90%**: Very relevant - strong connection to your query
-- **50-70%**: Moderately relevant - some useful information
-- **Below 50%**: Less relevant - filtered out by default
+#### **Option B: Local Embedding Server**
+```python
+openai_api_key = ""  # Leave empty
+openai_api_base = "http://your-server:8000/v1"
+embedding_model_name = "your-embedding-model"
+```
 
-## Best Practices
+### **3. Query Expansion Setup (Optional)**
+```python
+enable_query_expansion = True
+query_expansion_model = "your-llm-model"
+query_expansion_max_variations = 3
+```
 
-### For Administrators
+### **4. Reranking Setup (Optional)**
+```python
+enable_reranking = True
+reranker_model_name = "your-reranker-model"
+minimum_relevance_score = 0.7
+```
 
-1. **Embedding Server Setup**
-   - Use a local embedding server for better performance and privacy
-   - Recommended models: `bge-m3`, `e5-large-v2`
+## 📖 Usage Examples
 
-2. **Reranking Configuration**
-   - Enable reranking for better result quality
-   - Start with `minimum_relevance_score: 0.7` and adjust based on results
-   - Lower the threshold if getting too few results
-   - Raise it if getting irrelevant content
+### **Basic Search**
+```python
+# Search in page content
+await search_confluence("API authentication", "content")
 
-3. **Memory Management**
-   - Increase `chunk_size` for technical documentation (better context)
-   - Decrease for general content (more precise matching)
-   - Adjust `batch_size` based on your server capacity
+# Search in titles only  
+await search_confluence("deployment guide", "title")
 
-### For Users
+# Search both title and content
+await search_confluence("database setup", "title_and_content")
+```
 
-1. **Space Configuration**
-   - Always set `included_confluence_spaces` to limit search scope
-   - Use space keys, not space names
+### **Advanced Search Flow**
+1. **Query Expansion**: "API auth" → ["API authentication", "REST API security", "authentication endpoints"]
+2. **Multi-Search**: Searches Confluence with all variations
+3. **Content Retrieval**: Fetches full content of matching pages
+4. **Smart Chunking**: Breaks content into relevant sections
+5. **Semantic Analysis**: Finds content that matches query meaning
+6. **Reranking**: Ranks results by relevance confidence
+7. **Filtering**: Removes low-relevance content
+8. **Results**: Returns top relevant sections with scores
 
-2. **Search Queries**
-   - Be specific but not too narrow
-   - Use keywords that likely appear in your documentation
-   - Try different phrasings if first search doesn't yield results
+## 🔄 Version History
 
-3. **Authentication**
-   - Personal Access Tokens are more secure than API keys
-   - Create tokens with read-only permissions for safety
+- **0.7.0** - Added LLM-powered query expansion for improved search coverage
+- **0.6.1** - Added minimum relevance score filtering and score display in citations
+- **0.6.0** - Added reranking support with cross-encoder models
+- **0.5.0** - Replaced local sentence transformers with remote OpenAI API embeddings
 
-## Troubleshooting
+## 🏗️ Architecture
 
-### No Results Found
-- Check if `included_confluence_spaces` is set correctly
-- Verify space keys are correct (not space names)
-- Try broader search terms
-- Lower the `minimum_relevance_score` if reranking is enabled
+```
+Query Input
+    ↓
+Query Expansion (LLM) → Multiple Search Queries
+    ↓
+Confluence API Search → Page IDs
+    ↓  
+Content Retrieval → Full Page Content
+    ↓
+Document Chunking → Manageable Sections
+    ↓
+Embedding Generation → Vector Representations
+    ↓
+Hybrid Search (Semantic + Keyword) → Candidate Results
+    ↓
+Cross-Encoder Reranking → Relevance Scores
+    ↓
+Relevance Filtering → High-Quality Results
+    ↓
+Citation Generation → Final Output
+```
 
-### Authentication Errors
-- Verify your Confluence URL includes `/wiki`
-- Check API key or token validity
-- Ensure user has read access to specified spaces
+## 🚨 Important Notes
 
-### Slow Performance
-- Reduce `api_result_limit` to fetch fewer pages
-- Decrease `chunk_size` for faster processing
-- Consider using a local embedding server
+- **Space Configuration**: You MUST set `included_confluence_spaces` in User Settings
+- **Memory Management**: Large documents are automatically chunked and processed in batches
+- **API Compatibility**: Works with OpenAI API and OpenAI-compatible local servers
+- **Authentication**: Supports both API keys and Personal Access Tokens
+- **Error Handling**: Graceful fallbacks when individual components fail
 
-### Reranking Issues
-- Ensure reranker server is running and accessible
-- Check if the model name is correct
-- Verify the reranker endpoint (usually `/rerank` or `/v1/rerank`)
+## 🛠️ Troubleshooting
 
-## Version History
+### **No Search Results**
+- Check that `included_confluence_spaces` is set in User Settings
+- Verify Confluence credentials and permissions
+- Ensure the specified spaces exist and are accessible
 
-- **0.6.1** - Added minimum relevance score filtering and score display
-- **0.6.0** - Added cross-encoder reranking support
-- **0.5.0** - Switched to remote embedding servers
-- **0.4.0** - Added space inclusion/exclusion support
+### **Embedding Errors**
+- Verify embedding server URL and API key
+- Test connection to embedding endpoint
+- Check model name compatibility
 
-## Credits
+### **Query Expansion Issues**
+- Verify LLM server configuration
+- Check API key and model availability
+- Monitor logs for expansion errors (falls back to original query)
 
-- **Original Author**: [@romainneup](https://github.com/RomainNeup)
-- **Current Branch**: Gil Gedje
-- **Note**: This tool is a branch of the original work with added reranking and relevance scoring features
+### **Reranking Problems**
+- Ensure reranker endpoint is available (`/rerank` or `/v1/rerank`)
+- Verify model compatibility with cross-encoder format
+- Check relevance score thresholds
+
+## 🤝 Contributing
+
+This tool is a community effort! Original work by [@romainneup](https://github.com/RomainNeup), enhanced with remote embeddings, reranking, and query expansion features.
+
+- **Repository**: https://github.com/RomainNeup/open-webui-utilities
+- **Funding**: https://github.com/sponsors/RomainNeup
+
+## 📄 License
+
+See the original repository for license information.
